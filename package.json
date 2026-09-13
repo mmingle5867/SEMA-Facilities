@@ -1,0 +1,10 @@
+{
+  "name": "@selo/sema-facilities",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Small cross-application technical ports and helpers for SEMA.",
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "test": "tsx test/facilities.test.ts", "typecheck": "tsc --noEmit" },
+  "devDependencies": { "tsx": "^4.19.0", "typescript": "^5.3.3" }
+}
