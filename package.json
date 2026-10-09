@@ -1,13 +1,13 @@
 {
-  "name": "@selo/sema-facilities",
+  "name": "@selo/sema-foundation",
   "version": "0.1.1",
   "private": true,
-  "description": "Small cross-application technical ports and helpers for SEMA.",
+  "description": "SEMA Foundation: widely used functions (errors, logging, settings, documentation shape) installed with every installation.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": ["dist", "README.md", "docs"],
   "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
-  "scripts": { "build": "tsc -p tsconfig.build.json", "test": "tsx test/facilities.test.ts", "typecheck": "tsc --noEmit", "prepack": "npm run build" },
+  "scripts": { "build": "tsc -p tsconfig.build.json", "test": "tsx test/foundation.test.ts", "typecheck": "tsc --noEmit", "prepack": "npm run build" },
   "devDependencies": { "tsx": "^4.19.0", "typescript": "^5.3.3" }
 }

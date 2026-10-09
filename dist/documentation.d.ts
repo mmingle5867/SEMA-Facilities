@@ -8,5 +8,5 @@ export interface DocumentationManifest {
 }
 /** Common shape used by every SEMA package's self-description. */
 export declare function documentationManifest(input: DocumentationManifest): Readonly<DocumentationManifest>;
-export declare function getFacilitiesDocumentation(): Readonly<DocumentationManifest>;
+export declare function getFoundationDocumentation(): Readonly<DocumentationManifest>;
 //# sourceMappingURL=documentation.d.ts.map

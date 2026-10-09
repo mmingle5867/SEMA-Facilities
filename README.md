@@ -1,3 +1,3 @@
-# SEMA Facilities
+# SEMA Foundation
 
-Minimal technical ports and helpers shared across SEMA packages. See `docs/FACILITIES_SCOPE.md`.
+Widely used functions shared across SEMA, installed with every installation. See `docs/FOUNDATION_SCOPE.md` and `getFoundationDocumentation()`.
