@@ -1,6 +1,6 @@
 import { RESOURCE_CATALOG_CAPABILITY, RESOURCE_DELIVERY_CAPABILITY } from './contracts.js';
-const core = (process.env.SEMA_CORE_URL ?? 'http://127.0.0.1:4310').replace(/\/$/, ''); const facility = (process.env.SEMA_RESOURCE_FACILITY_URL ?? 'http://127.0.0.1:4330').replace(/\/$/, '');
+const core = (process.env.SEMA_CORE_URL ?? 'http://127.0.0.1:4310').replace(/\/$/, ''); const facility = ((process.env.SEMA_RESOURCE_URL ?? process.env.SEMA_RESOURCE_FACILITY_URL ?? 'http://127.0.0.1:4330')).replace(/\/$/, '');
 async function register(capabilityKey: string, displayName: string, endpointPath: string) { const response = await fetch(`${core}/v1/core/runtime/capabilities`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ capabilityKey, displayName, description: 'Policy-controlled Foundation resource facility.', providerKey: 'sema.foundation.resource-facility', version: '1.0.0', metadata: { endpointUrl: `${facility}${endpointPath}`, contractVersion: '1.0.0', localFirst: true, referenceOnly: true, policyControlled: true } }) }); if (!response.ok) throw new Error(await response.text()); }
 await register(RESOURCE_CATALOG_CAPABILITY, 'Discover Shared Resources', '/v1/resources/catalog');
 await register(RESOURCE_DELIVERY_CAPABILITY, 'Deliver Shared Resource Content', '/v1/resources');
-console.log('SEMA Foundation Resource Facility registered with Core.');
+console.log('SEMA Foundation Resource registered with Core.');
