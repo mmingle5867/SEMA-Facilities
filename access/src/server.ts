@@ -1,0 +1,218 @@
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { randomUUID } from 'node:crypto';
+import type { AccessGrant, AccessGroup, ApplicationDefinition, CatalogRelease, ChangePacket, Delegation, GroupMembership, RoleDefinition, SemaNode, StorageLocation, TestingNote, User, Workspace, Organization, Membership } from './contracts.js';
+import { AuthStore } from './auth-store.js';
+import { authenticateToken, bearerToken, createCredential, issueSession, normalizeEmail, verifyPassword, workspacesForUser } from './auth.js';
+import { AccessStore } from './store.js';
+import { CoreClient } from './core-client.js';
+
+const json = (response: ServerResponse, status: number, value: unknown) => { response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); response.end(JSON.stringify(value)); };
+async function body(request: IncomingMessage) { const chunks: Buffer[] = []; let length = 0; for await (const chunk of request) { const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk); length += value.length; if (length > 256 * 1024) throw new Error('Request body exceeds 256 KiB'); chunks.push(value); } const source = Buffer.concat(chunks).toString('utf8').trim(); return source ? JSON.parse(source) as Record<string, unknown> : {}; }
+const text = (value: unknown, name: string) => { if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} is required`); return value.trim(); };
+const optional = (value: unknown) => typeof value === 'string' && value.trim() ? value.trim() : undefined;
+const stringArray = (value: unknown, name: string) => { if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string' || !entry.trim())) throw new Error(`${name} must be a non-empty string array`); return (value as string[]).map((entry) => entry.trim()); };
+const optionalStringArray = (value: unknown, fallback: string[]) => value === undefined ? fallback : stringArray(value, 'roleKeys');
+const recordStatus = (value: unknown) => { const status = text(value, 'status') as User['status']; if (!['ACTIVE', 'SUSPENDED', 'RETIRED'].includes(status)) throw new Error('Invalid record status'); return status; };
+const nodeStatus = (value: unknown) => { const status = text(value, 'status') as SemaNode['status']; if (!['PROVISIONING', 'ACTIVE', 'SUSPENDED', 'RETIRED'].includes(status)) throw new Error('Invalid node status'); return status; };
+
+export function createAccessServer(input: { store: AccessStore; authStore: AuthStore; core: CoreClient; adminKey: string; bootstrapKey: string; policyKey: string; sessionKey: string; sessionTtlMinutes: number }) {
+  const admin = (request: IncomingMessage) => input.adminKey !== 'replace-with-a-strong-local-admin-key' && request.headers['x-sema-access-admin-key'] === input.adminKey;
+  const bootstrap = (request: IncomingMessage) => input.bootstrapKey !== 'replace-with-a-one-time-bootstrap-key' && request.headers['x-sema-access-bootstrap-key'] === input.bootstrapKey;
+  const audit = async (action: string, ids: string[], evidence: Record<string, unknown> = {}) => input.core.audit(action, ids, evidence);
+  return createServer(async (request, response) => {
+    const url = new URL(request.url ?? '/', 'http://127.0.0.1');
+    try {
+      if (request.method === 'GET' && url.pathname === '/v1/access/health') { const index = await input.store.load(); return json(response, 200, { status: 'ACTIVE', service: 'sema.foundation.access', version: '0.6.0', bootstrapped: Boolean(index.bootstrappedAt), authentication: 'LOCAL_PASSWORD_SESSION' }); }
+      if (request.method === 'GET' && url.pathname === '/v1/access/index') { if (!admin(request)) return json(response, 403, { error: 'Administration is required.' }); return json(response, 200, await input.store.load()); }
+
+      if (request.method === 'POST' && url.pathname === '/v1/access/policy/evaluate') {
+        if (request.headers['x-sema-access-policy-key'] !== input.policyKey) return json(response, 403, { error: 'Policy evaluation is not authorized.' });
+        const payload = await body(request); const applicationKey = text(payload.applicationKey, 'applicationKey'); const operation = text(payload.operation, 'operation'); const index = await input.store.load();
+        const application = index.applications.find((candidate) => candidate.applicationKey === applicationKey && candidate.status === 'ACTIVE');
+        const now = Date.now(); const allowed = Boolean(application && index.grants.some((grant) => grant.granteeKind === 'APPLICATION' && grant.granteeId === application.id && !grant.revokedAt && (!grant.expiresAt || Date.parse(grant.expiresAt) > now) && grant.operations.some((candidate) => candidate === operation || candidate === 'core.*' || (candidate.endsWith('.*') && operation.startsWith(candidate.slice(0, -1))))));
+        return json(response, 200, { allowed, applicationKey, operation });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/access/auth/login') {
+        const payload = await body(request);
+        let email: string;
+        try { email = normalizeEmail(text(payload.email, 'email')); } catch { return json(response, 401, { error: 'Email or password is incorrect.' }); }
+        const password = typeof payload.password === 'string' ? payload.password : '';
+        const requestedWorkspaceId = optional(payload.workspaceId);
+        const index = await input.store.load();
+        const user = index.users.find((candidate) => candidate.email?.trim().toLowerCase() === email);
+        const state = await input.authStore.load();
+        const credential = state.credentials.find((candidate) => candidate.emailNormalized === email);
+        const now = Date.now();
+        if (!user || user.status !== 'ACTIVE' || !credential || (credential.lockedUntil && Date.parse(credential.lockedUntil) > now) || !(await verifyPassword(credential, password))) {
+          await input.authStore.update((next) => {
+            const target = next.credentials.find((candidate) => candidate.emailNormalized === email);
+            if (!target) return;
+            target.failedLoginCount += 1;
+            if (target.failedLoginCount >= 10) { target.lockedUntil = new Date(Date.now() + 15 * 60_000).toISOString(); target.failedLoginCount = 0; }
+          });
+          return json(response, 401, { error: 'Email or password is incorrect.' });
+        }
+        const workspaces = workspacesForUser({ user, workspaces: index.workspaces, memberships: index.memberships });
+        const workspaceId = requestedWorkspaceId ?? (workspaces.length === 1 ? workspaces[0]!.id : undefined);
+        if (workspaceId && !workspaces.some((workspace) => workspace.id === workspaceId)) return json(response, 403, { error: 'The selected workspace is not available to this user.' });
+        const issued = issueSession({ userId: user.id, workspaceId, ttlMinutes: input.sessionTtlMinutes, signingKey: input.sessionKey });
+        await input.authStore.update((next) => {
+          const target = next.credentials.find((candidate) => candidate.userId === user.id);
+          if (target) { target.failedLoginCount = 0; target.lockedUntil = undefined; }
+          next.sessions = next.sessions.filter((session) => !session.revokedAt && Date.parse(session.expiresAt) > Date.now());
+          next.sessions.push(issued.session);
+        });
+        await audit('foundation-access.auth.login', [user.id], { workspaceId });
+        return json(response, 200, { accessToken: issued.accessToken, expiresAt: issued.session.expiresAt, user, workspaces, workspaceId });
+      }
+
+      if (request.method === 'GET' && url.pathname === '/v1/access/auth/me') {
+        const state = await input.authStore.load();
+        const authenticated = authenticateToken(bearerToken(request.headers.authorization), state, input.sessionKey);
+        const index = await input.store.load();
+        const user = index.users.find((candidate) => candidate.id === authenticated.userId && candidate.status === 'ACTIVE');
+        if (!user) return json(response, 401, { error: 'The signed-in user is no longer active.' });
+        const workspaces = workspacesForUser({ user, workspaces: index.workspaces, memberships: index.memberships });
+        return json(response, 200, { user, workspaceId: authenticated.workspaceId, workspaces, expiresAt: authenticated.session.expiresAt });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/access/auth/logout') {
+        const state = await input.authStore.load();
+        const authenticated = authenticateToken(bearerToken(request.headers.authorization), state, input.sessionKey);
+        await input.authStore.update((next) => { const session = next.sessions.find((candidate) => candidate.id === authenticated.session.id); if (session) session.revokedAt = new Date().toISOString(); });
+        await audit('foundation-access.auth.logout', [authenticated.userId]);
+        return json(response, 200, { success: true });
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/access/bootstrap') {
+        if (!bootstrap(request)) return json(response, 403, { error: 'A valid one-time bootstrap key is required.' });
+        const payload = await body(request); const index = await input.store.load(); if (index.bootstrappedAt) return json(response, 409, { error: 'Foundation Access is already bootstrapped.' });
+        const user: User = { id: await input.core.issue('USER', { purpose: 'initial-owner' }), displayName: text(payload.userDisplayName, 'userDisplayName'), email: optional(payload.email), status: 'ACTIVE', createdAt: new Date().toISOString() };
+        const organization: Organization = { id: await input.core.issue('ORGANIZATION', { purpose: 'initial-owner-organization' }), displayName: text(payload.organizationDisplayName, 'organizationDisplayName'), status: 'ACTIVE', createdAt: new Date().toISOString() };
+        const workspaces: Workspace[] = await Promise.all(stringArray(payload.workspaces, 'workspaces').map(async (displayName) => ({ id: await input.core.issue('WORKSPACE', { organizationId: organization.id }), organizationId: organization.id, displayName, kind: 'GENERAL', status: 'ACTIVE' as const, createdAt: new Date().toISOString() })));
+        const membership: Membership = { id: await input.core.issue('MEMBERSHIP', { userId: user.id, organizationId: organization.id }), userId: user.id, organizationId: organization.id, roleKeys: ['organization.owner'], status: 'ACTIVE', createdAt: new Date().toISOString() };
+        const rootNode: SemaNode = { id: await input.core.issue('NODE', { purpose: 'initial-managed-node' }), displayName: text(payload.rootNodeDisplayName, 'rootNodeDisplayName'), classification: optional(payload.rootNodeClassification), status: 'ACTIVE', controllerOrganizationId: organization.id, issuedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+        index.users.push(user); index.organizations.push(organization); index.workspaces.push(...workspaces); index.memberships.push(membership); index.nodes.push(rootNode); index.bootstrappedAt = new Date().toISOString(); await input.store.save(index);
+        await audit('foundation-access.bootstrap.completed', [user.id, organization.id, membership.id, rootNode.id, ...workspaces.map((workspace) => workspace.id)]);
+        return json(response, 201, { user, organization, workspaces, membership, rootNode });
+      }
+
+      if (!admin(request)) return json(response, 403, { error: 'Administration is required.' });
+      if (request.method === 'GET' && url.pathname === '/v1/access/users') return json(response, 200, (await input.store.load()).users);
+      if (request.method === 'GET' && url.pathname === '/v1/access/organizations') return json(response, 200, (await input.store.load()).organizations);
+      if (request.method === 'GET' && url.pathname === '/v1/access/workspaces') return json(response, 200, (await input.store.load()).workspaces);
+      if (request.method === 'GET' && url.pathname === '/v1/access/nodes') return json(response, 200, (await input.store.load()).nodes);
+      if (request.method === 'GET' && url.pathname === '/v1/access/applications') return json(response, 200, (await input.store.load()).applications);
+      if (request.method === 'GET' && url.pathname === '/v1/access/catalog/releases') return json(response, 200, (await input.store.load()).catalogReleases);
+      if (request.method === 'GET' && url.pathname === '/v1/access/testing-notes') return json(response, 200, (await input.store.load()).testingNotes);
+      if (request.method === 'GET' && url.pathname === '/v1/access/change-packets') return json(response, 200, (await input.store.load()).changePackets);
+
+      if (request.method === 'POST' && url.pathname === '/v1/access/testing-notes') {
+        const payload = await body(request); const index = await input.store.load(); const subjectKind = text(payload.subjectKind, 'subjectKind') as TestingNote['subjectKind']; const subjectId = text(payload.subjectId, 'subjectId'); let subjectLabel: string; let subjectVersion: string | undefined; let applicationId: string | undefined; let applicationKey: string | undefined;
+        if (subjectKind === 'APPLICATION') { const application = index.applications.find((entry) => entry.id === subjectId); if (!application) throw new Error('Application target does not exist'); subjectLabel = application.displayName; subjectVersion = optional(payload.subjectVersion) ?? application.version; applicationId = application.id; applicationKey = application.applicationKey; }
+        else if (subjectKind === 'CAPABILITY' || subjectKind === 'SERVICE') { const release = index.catalogReleases.find((entry) => entry.id === subjectId); if (!release) throw new Error('Capability or service target does not exist'); subjectLabel = release.displayName; subjectVersion = optional(payload.subjectVersion) ?? release.version; }
+        else if (subjectKind === 'CORE') { if (subjectId !== 'sema.core') throw new Error('Invalid Core target'); subjectLabel = 'SEMA Core'; subjectVersion = optional(payload.subjectVersion); }
+        else if (subjectKind === 'SYSTEM_CONSOLE') { if (subjectId !== 'sema.system.console') throw new Error('Invalid System Console target'); subjectLabel = 'SEMA System Console'; subjectVersion = optional(payload.subjectVersion); }
+        else throw new Error('Invalid testing note target');
+        const kind = text(payload.kind, 'kind') as TestingNote['kind']; const priority = text(payload.priority, 'priority') as TestingNote['priority']; if (!['TEST_NOTE', 'DEFECT', 'CHANGE_REQUEST', 'QUESTION'].includes(kind) || !['LOW', 'NORMAL', 'HIGH', 'CRITICAL'].includes(priority)) throw new Error('Invalid note kind or priority');
+        const now = new Date().toISOString(); const note: TestingNote = { id: await input.core.issue('TESTING_NOTE', { subjectKind, subjectId }), applicationId, applicationKey, applicationVersion: subjectVersion, subjectKind, subjectId, subjectLabel, subjectVersion, kind, priority, title: text(payload.title, 'title'), detail: text(payload.detail, 'detail'), status: 'OPEN', selectedForPacket: false, createdAt: now, updatedAt: now, history: [{ at: now, action: 'CREATED' }] };
+        await input.store.update((next) => { next.testingNotes.push(note); }); await audit('testing-note.created', [note.id, ...(applicationId ? [applicationId] : [])], { subjectKind, subjectId, kind, priority }); return json(response, 201, note);
+      }
+      if (request.method === 'POST' && /^\/v1\/access\/testing-notes\/[^/]+$/.test(url.pathname)) {
+        const noteId = decodeURIComponent(url.pathname.split('/')[4] ?? ''); const payload = await body(request); const note = await input.store.update((index) => { const target = index.testingNotes.find((entry) => entry.id === noteId); if (!target) throw new Error('Testing note does not exist'); const status = text(payload.status, 'status') as TestingNote['status']; if (!['OPEN', 'DEFERRED', 'REJECTED', 'SELECTED', 'IMPLEMENTED'].includes(status)) throw new Error('Invalid testing note status'); const resolution = optional(payload.resolution); target.status = status; target.selectedForPacket = payload.selectedForPacket === true; target.updatedAt = new Date().toISOString(); target.history.push({ at: target.updatedAt, action: status, detail: resolution }); return target; }); await audit('testing-note.updated', [note.id, ...(note.applicationId ? [note.applicationId] : [])], { status: note.status }); return json(response, 200, note);
+      }
+      if (request.method === 'POST' && url.pathname === '/v1/access/change-packets') {
+        const payload = await body(request); const noteIds = stringArray(payload.noteIds, 'noteIds'); const index = await input.store.load(); const notes = index.testingNotes.filter((note) => noteIds.includes(note.id)); if (notes.length !== noteIds.length) throw new Error('One or more testing notes do not exist'); const first = notes[0]; if (!first || notes.some((note) => note.subjectKind !== first.subjectKind || note.subjectId !== first.subjectId)) throw new Error('A Change Packet may contain notes for one target only'); const summary = ['# Proposed change packet', '', `Target: ${first.subjectLabel}`, `Target type: ${first.subjectKind}`, `Version: ${first.subjectVersion ?? 'not recorded'}`, '', '## Requested changes', ...notes.map((note, position) => `${position + 1}. [${note.kind}/${note.priority}] ${note.title}\n   ${note.detail}`), '', '## Acceptance checks', ...notes.map((note, position) => `${position + 1}. Confirm: ${note.title}`), '', '## Record handling', 'Selected testing notes are attached below. Rejected and deferred notes are intentionally excluded unless later selected.'].join('\n'); const packet: ChangePacket = { id: await input.core.issue('CHANGE_PACKET', { subjectKind: first.subjectKind, subjectId: first.subjectId }), applicationId: first.applicationId, applicationKey: first.applicationKey, subjectKind: first.subjectKind, subjectId: first.subjectId, subjectLabel: first.subjectLabel, subjectVersion: first.subjectVersion, createdAt: new Date().toISOString(), noteIds, summary, status: 'DRAFT' };
+        await input.store.update((next) => { next.changePackets.push(packet); for (const note of next.testingNotes) if (noteIds.includes(note.id)) { note.status = 'SELECTED'; note.selectedForPacket = true; note.updatedAt = packet.createdAt; note.history.push({ at: packet.createdAt, action: 'INCLUDED_IN_CHANGE_PACKET', detail: packet.id }); } }); await audit('change-packet.created', [packet.id, ...(first.applicationId ? [first.applicationId] : []), ...noteIds]); return json(response, 201, packet);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/access/users') {
+        const payload = await body(request);
+        const displayName = text(payload.displayName, 'displayName');
+        const user: User = { id: await input.core.issue('USER', { purpose: 'user-administration-person-record' }), displayName, status: 'ACTIVE', createdAt: new Date().toISOString() };
+        await input.store.update((next) => { next.users.push(user); });
+        await audit('foundation-access.user.created', [user.id]);
+        return json(response, 201, { user });
+      }
+
+      if (request.method === 'POST' && /^\/v1\/access\/users\/[^/]+\/credentials$/.test(url.pathname)) {
+        const userId = decodeURIComponent(url.pathname.split('/')[4] ?? '');
+        const payload = await body(request);
+        const email = normalizeEmail(text(payload.email, 'email'));
+        const password = text(payload.password, 'password');
+        const user = await input.store.update((next) => {
+          const target = next.users.find((candidate) => candidate.id === userId);
+          if (!target) throw new Error('User does not exist');
+          if (target.email && target.email.trim().toLowerCase() !== email) throw new Error('email does not match the user record');
+          if (next.users.some((candidate) => candidate.id !== userId && candidate.email?.trim().toLowerCase() === email)) throw new Error('email is already registered');
+          target.email = email;
+          return target;
+        });
+        const credential = await createCredential(user.id, email, password);
+        await input.authStore.update((next) => {
+          if (next.credentials.some((candidate) => candidate.userId !== userId && candidate.emailNormalized === email)) throw new Error('email is already registered');
+          next.credentials = next.credentials.filter((candidate) => candidate.userId !== userId);
+          next.credentials.push(credential);
+          for (const session of next.sessions) if (session.userId === userId && !session.revokedAt) session.revokedAt = new Date().toISOString();
+        });
+        await audit('foundation-access.user.credentials.reset', [userId]);
+        return json(response, 200, { userId, email: user.email, sessionsRevoked: true });
+      }
+
+      if (request.method === 'POST' && /^\/v1\/access\/users\/[^/]+\/status$/.test(url.pathname)) {
+        const userId = decodeURIComponent(url.pathname.split('/')[4] ?? '');
+        const payload = await body(request);
+        const status = recordStatus(payload.status);
+        const user = await input.store.update((next) => { const target = next.users.find((candidate) => candidate.id === userId); if (!target) throw new Error('User does not exist'); target.status = status; return target; });
+        if (status !== 'ACTIVE') await input.authStore.update((next) => { for (const session of next.sessions) if (session.userId === userId && !session.revokedAt) session.revokedAt = new Date().toISOString(); });
+        await audit('foundation-access.user.status.changed', [userId], { status });
+        return json(response, 200, user);
+      }
+
+      if (request.method === 'POST' && /^\/v1\/access\/users\/[^/]+\/profile$/.test(url.pathname)) {
+        const userId = decodeURIComponent(url.pathname.split('/')[4] ?? ''); const payload = await body(request);
+        const user = await input.store.update((next) => { const target = next.users.find((candidate) => candidate.id === userId); if (!target) throw new Error('User does not exist'); target.displayName = text(payload.displayName, 'displayName'); return target; });
+        await audit('foundation-access.user.profile.updated', [userId]); return json(response, 200, user);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/access/memberships') {
+        const payload = await body(request); const userId = text(payload.userId, 'userId'); const organizationId = text(payload.organizationId, 'organizationId'); const workspaceId = optional(payload.workspaceId); const roleKeys = optionalStringArray(payload.roleKeys, ['workspace.member']);
+        const membership: Membership = { id: await input.core.issue('MEMBERSHIP', { userId, organizationId, workspaceId }), userId, organizationId, workspaceId, roleKeys, status: 'ACTIVE', createdAt: new Date().toISOString() };
+        await input.store.update((index) => { if (!index.users.some((entry) => entry.id === userId && entry.status === 'ACTIVE')) throw new Error('userId does not exist or is not active'); if (!index.organizations.some((entry) => entry.id === organizationId && entry.status === 'ACTIVE')) throw new Error('organizationId does not exist or is not active'); if (workspaceId && !index.workspaces.some((entry) => entry.id === workspaceId && entry.organizationId === organizationId && entry.status === 'ACTIVE')) throw new Error('workspaceId does not exist for organizationId'); if (index.memberships.some((entry) => entry.userId === userId && entry.organizationId === organizationId && entry.workspaceId === workspaceId && entry.status === 'ACTIVE')) throw new Error('An active matching membership already exists'); index.memberships.push(membership); });
+        await audit('foundation-access.membership.created', [membership.id, userId, organizationId, ...(workspaceId ? [workspaceId] : [])]); return json(response, 201, membership);
+      }
+
+      if (request.method === 'POST' && /^\/v1\/access\/memberships\/[^/]+$/.test(url.pathname)) {
+        const membershipId = decodeURIComponent(url.pathname.split('/')[4] ?? ''); const payload = await body(request); const roles = optionalStringArray(payload.roleKeys, []); const status = recordStatus(payload.status);
+        const membership = await input.store.update((index) => { const target = index.memberships.find((entry) => entry.id === membershipId); if (!target) throw new Error('Membership does not exist'); target.roleKeys = roles; target.status = status; return target; });
+        await audit('foundation-access.membership.updated', [membership.id, membership.userId, membership.organizationId], { status }); return json(response, 200, membership);
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/access/roles') { const payload = await body(request); const role: RoleDefinition = { id: await input.core.issue('ROLE'), key: text(payload.key, 'key'), displayName: text(payload.displayName, 'displayName'), description: optional(payload.description), scopeKind: text(payload.scopeKind, 'scopeKind') as RoleDefinition['scopeKind'], status: 'ACTIVE', createdAt: new Date().toISOString() }; if (!['ORGANIZATION', 'WORKSPACE'].includes(role.scopeKind)) throw new Error('Invalid role scopeKind'); await input.store.update((index) => { if (index.roleDefinitions.some((entry) => entry.key === role.key)) throw new Error('role key is already registered'); index.roleDefinitions.push(role); }); await audit('foundation-access.role.created', [role.id], { key: role.key, scopeKind: role.scopeKind }); return json(response, 201, role); }
+      if (request.method === 'POST' && url.pathname === '/v1/access/groups') { const payload = await body(request); const organizationId = text(payload.organizationId, 'organizationId'); const workspaceId = optional(payload.workspaceId); const group: AccessGroup = { id: await input.core.issue('GROUP', { organizationId, workspaceId }), organizationId, workspaceId, displayName: text(payload.displayName, 'displayName'), description: optional(payload.description), status: 'ACTIVE', createdAt: new Date().toISOString() }; await input.store.update((index) => { if (!index.organizations.some((entry) => entry.id === organizationId && entry.status === 'ACTIVE')) throw new Error('organizationId does not exist or is not active'); if (workspaceId && !index.workspaces.some((entry) => entry.id === workspaceId && entry.organizationId === organizationId && entry.status === 'ACTIVE')) throw new Error('workspaceId does not exist for organizationId'); index.groups.push(group); }); await audit('foundation-access.group.created', [group.id, organizationId, ...(workspaceId ? [workspaceId] : [])]); return json(response, 201, group); }
+      if (request.method === 'POST' && url.pathname === '/v1/access/group-memberships') { const payload = await body(request); const groupId = text(payload.groupId, 'groupId'); const userId = text(payload.userId, 'userId'); const membership: GroupMembership = { id: await input.core.issue('GROUP_MEMBERSHIP', { groupId, userId }), groupId, userId, status: 'ACTIVE', createdAt: new Date().toISOString() }; await input.store.update((index) => { const group = index.groups.find((entry) => entry.id === groupId && entry.status === 'ACTIVE'); if (!group) throw new Error('groupId does not exist or is not active'); if (!index.users.some((entry) => entry.id === userId && entry.status === 'ACTIVE')) throw new Error('userId does not exist or is not active'); if (index.groupMemberships.some((entry) => entry.groupId === groupId && entry.userId === userId && entry.status === 'ACTIVE')) throw new Error('An active matching group membership already exists'); index.groupMemberships.push(membership); }); await audit('foundation-access.group-membership.created', [membership.id, groupId, userId]); return json(response, 201, membership); }
+      if (request.method === 'POST' && url.pathname === '/v1/access/delegations') { const payload = await body(request); const delegatorUserId = text(payload.delegatorUserId, 'delegatorUserId'); const delegateUserId = text(payload.delegateUserId, 'delegateUserId'); const organizationId = text(payload.organizationId, 'organizationId'); const workspaceId = optional(payload.workspaceId); const effectiveAt = text(payload.effectiveAt, 'effectiveAt'); const expiresAt = text(payload.expiresAt, 'expiresAt'); if (delegatorUserId === delegateUserId) throw new Error('A user cannot delegate to themselves'); if (!Number.isFinite(Date.parse(effectiveAt)) || !Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) <= Date.parse(effectiveAt)) throw new Error('Delegation expiry must be after its effective time'); const delegation: Delegation = { id: await input.core.issue('DELEGATION', { delegatorUserId, delegateUserId, organizationId, workspaceId }), delegatorUserId, delegateUserId, organizationId, workspaceId, applicationKey: optional(payload.applicationKey), operations: stringArray(payload.operations, 'operations'), effectiveAt, expiresAt, note: optional(payload.note), createdAt: new Date().toISOString() }; await input.store.update((index) => { for (const id of [delegatorUserId, delegateUserId]) if (!index.users.some((entry) => entry.id === id && entry.status === 'ACTIVE')) throw new Error('Both delegator and delegate must be active users'); if (!index.memberships.some((entry) => entry.userId === delegatorUserId && entry.organizationId === organizationId && entry.status === 'ACTIVE')) throw new Error('Delegator lacks an active organization membership'); if (!index.memberships.some((entry) => entry.userId === delegateUserId && entry.organizationId === organizationId && entry.status === 'ACTIVE')) throw new Error('Delegate lacks an active organization membership'); if (workspaceId && !index.workspaces.some((entry) => entry.id === workspaceId && entry.organizationId === organizationId && entry.status === 'ACTIVE')) throw new Error('workspaceId does not exist for organizationId'); index.delegations.push(delegation); }); await audit('foundation-access.delegation.created', [delegation.id, delegatorUserId, delegateUserId, organizationId, ...(workspaceId ? [workspaceId] : [])], { operations: delegation.operations, expiresAt }); return json(response, 201, delegation); }
+      if (request.method === 'POST' && /^\/v1\/access\/delegations\/[^/]+\/revoke$/.test(url.pathname)) { const delegationId = decodeURIComponent(url.pathname.split('/')[4] ?? ''); const delegation = await input.store.update((index) => { const target = index.delegations.find((entry) => entry.id === delegationId); if (!target) throw new Error('Delegation does not exist'); if (!target.revokedAt) target.revokedAt = new Date().toISOString(); return target; }); await audit('foundation-access.delegation.revoked', [delegation.id, delegation.delegatorUserId, delegation.delegateUserId]); return json(response, 200, delegation); }
+
+      if (request.method === 'POST' && /^\/v1\/access\/organizations\/[^/]+$/.test(url.pathname)) { const organizationId = decodeURIComponent(url.pathname.split('/')[4] ?? ''); const payload = await body(request); const organization = await input.store.update((index) => { const target = index.organizations.find((entry) => entry.id === organizationId); if (!target) throw new Error('Organization does not exist'); target.displayName = text(payload.displayName, 'displayName'); target.status = recordStatus(payload.status); return target; }); await audit('foundation-access.organization.updated', [organizationId], { status: organization.status }); return json(response, 200, organization); }
+      if (request.method === 'POST' && url.pathname === '/v1/access/organizations') { const payload = await body(request); const organization: Organization = { id: await input.core.issue('ORGANIZATION'), displayName: text(payload.displayName, 'displayName'), status: 'ACTIVE', createdAt: new Date().toISOString() }; await input.store.update((index) => { index.organizations.push(organization); }); await audit('organization.created', [organization.id]); return json(response, 201, organization); }
+      if (request.method === 'POST' && /^\/v1\/access\/workspaces\/[^/]+$/.test(url.pathname)) { const workspaceId = decodeURIComponent(url.pathname.split('/')[4] ?? ''); const payload = await body(request); const workspace = await input.store.update((index) => { const target = index.workspaces.find((entry) => entry.id === workspaceId); if (!target) throw new Error('Workspace does not exist'); target.displayName = text(payload.displayName, 'displayName'); target.kind = text(payload.kind, 'kind'); target.status = recordStatus(payload.status); return target; }); await audit('foundation-access.workspace.updated', [workspaceId, workspace.organizationId], { status: workspace.status }); return json(response, 200, workspace); }
+      if (request.method === 'POST' && url.pathname === '/v1/access/workspaces') { const payload = await body(request); const organizationId = text(payload.organizationId, 'organizationId'); const workspace: Workspace = { id: await input.core.issue('WORKSPACE', { organizationId }), organizationId, displayName: text(payload.displayName, 'displayName'), kind: optional(payload.kind) ?? 'GENERAL', status: 'ACTIVE', createdAt: new Date().toISOString() }; await input.store.update((index) => { if (!index.organizations.some((organization) => organization.id === organizationId)) throw new Error('organizationId does not exist'); index.workspaces.push(workspace); }); await audit('workspace.created', [workspace.id, organizationId]); return json(response, 201, workspace); }
+      if (request.method === 'POST' && /^\/v1\/access\/nodes\/[^/]+\/profile$/.test(url.pathname)) { const nodeId = decodeURIComponent(url.pathname.split('/')[4] ?? ''); const payload = await body(request); const node = await input.store.update((index) => { const target = index.nodes.find((entry) => entry.id === nodeId); if (!target) throw new Error('Node does not exist'); const controllerOrganizationId = optional(payload.controllerOrganizationId); if (controllerOrganizationId && !index.organizations.some((entry) => entry.id === controllerOrganizationId)) throw new Error('controllerOrganizationId does not exist'); target.displayName = text(payload.displayName, 'displayName'); target.classification = optional(payload.classification); target.status = nodeStatus(payload.status); target.controllerOrganizationId = controllerOrganizationId; target.updatedAt = new Date().toISOString(); return target; }); await audit('node.profile.updated', [node.id], { status: node.status }); return json(response, 200, node); }
+      if (request.method === 'POST' && url.pathname === '/v1/access/nodes') { const payload = await body(request); const issuingParentNodeId = optional(payload.issuingParentNodeId); const operationalParentNodeId = optional(payload.operationalParentNodeId); const controllerOrganizationId = optional(payload.controllerOrganizationId); const node: SemaNode = { id: await input.core.issue('NODE', { issuingParentNodeId, controllerOrganizationId }), displayName: text(payload.displayName, 'displayName'), classification: optional(payload.classification), status: 'PROVISIONING', issuingParentNodeId, operationalParentNodeId, controllerOrganizationId, issuedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }; await input.store.update((index) => { for (const parentId of [issuingParentNodeId, operationalParentNodeId]) if (parentId && !index.nodes.some((candidate) => candidate.id === parentId)) throw new Error('A specified parent node does not exist'); if (controllerOrganizationId && !index.organizations.some((candidate) => candidate.id === controllerOrganizationId)) throw new Error('controllerOrganizationId does not exist'); index.nodes.push(node); }); await audit('node.created', [node.id, ...(issuingParentNodeId ? [issuingParentNodeId] : [])]); return json(response, 201, node); }
+      if (request.method === 'POST' && /^\/v1\/access\/nodes\/[^/]+\/rehome$/.test(url.pathname)) { const nodeId = decodeURIComponent(url.pathname.split('/')[4] ?? ''); const payload = await body(request); const nextParentId = optional(payload.operationalParentNodeId); const node = await input.store.update((index) => { const subject = index.nodes.find((candidate) => candidate.id === nodeId); if (!subject) throw new Error('Node does not exist'); if (nextParentId && !index.nodes.some((candidate) => candidate.id === nextParentId)) throw new Error('operationalParentNodeId does not exist'); if (nextParentId === nodeId) throw new Error('A node cannot parent itself'); subject.operationalParentNodeId = nextParentId; subject.updatedAt = new Date().toISOString(); return subject; }); await audit('node.rehomed', [node.id, ...(nextParentId ? [nextParentId] : [])], { permanentIssuingParentUnchanged: true }); return json(response, 200, node); }
+      if (request.method === 'POST' && url.pathname === '/v1/access/applications/import') { const payload = await body(request); const applicationKey = text(payload.applicationKey, 'applicationKey'); const manifest = (payload.manifest && typeof payload.manifest === 'object' && !Array.isArray(payload.manifest) ? payload.manifest : {}) as Record<string, unknown>; const application: ApplicationDefinition = { id: await input.core.issue('APPLICATION', { applicationKey }), applicationKey, displayName: text(payload.displayName, 'displayName'), vendor: optional(payload.vendor), version: text(payload.version, 'version'), description: optional(payload.description), manifest, status: 'ACTIVE', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }; await input.store.update((index) => { if (index.applications.some((candidate) => candidate.applicationKey === applicationKey)) throw new Error('applicationKey is already registered'); index.applications.push(application); }); await audit('application.registered', [application.id], { applicationKey }); return json(response, 201, application); }
+      if (request.method === 'POST' && /^\/v1\/access\/applications\/[^/]+$/.test(url.pathname)) { const applicationId = decodeURIComponent(url.pathname.split('/')[4] ?? ''); const payload = await body(request); const application = await input.store.update((index) => { const target = index.applications.find((entry) => entry.id === applicationId); if (!target) throw new Error('Application does not exist'); target.displayName = text(payload.displayName, 'displayName'); target.vendor = optional(payload.vendor); target.version = text(payload.version, 'version'); target.description = optional(payload.description); target.status = recordStatus(payload.status); target.updatedAt = new Date().toISOString(); return target; }); await audit('application.updated', [application.id], { applicationKey: application.applicationKey, status: application.status }); return json(response, 200, application); }
+      if (request.method === 'POST' && url.pathname === '/v1/access/catalog/releases') { const payload = await body(request); const release: CatalogRelease = { id: await input.core.issue('SERVICE_RELEASE'), capabilityKey: text(payload.capabilityKey, 'capabilityKey'), providerKey: text(payload.providerKey, 'providerKey'), serviceKey: text(payload.serviceKey, 'serviceKey'), version: text(payload.version, 'version'), displayName: text(payload.displayName, 'displayName'), packageUri: optional(payload.packageUri), packageHash: optional(payload.packageHash), manifest: (payload.manifest && typeof payload.manifest === 'object' && !Array.isArray(payload.manifest) ? payload.manifest : {}) as Record<string, unknown>, trustStatus: 'UNVERIFIED', status: 'DISCOVERED', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }; await input.store.update((index) => { index.catalogReleases.push(release); }); await audit('catalog.release.discovered', [release.id], { capabilityKey: release.capabilityKey, serviceKey: release.serviceKey }); return json(response, 201, release); }
+      if (request.method === 'POST' && /^\/v1\/access\/catalog\/releases\/[^/]+\/transition$/.test(url.pathname)) { const releaseId = decodeURIComponent(url.pathname.split('/')[5] ?? ''); const payload = await body(request); const trustStatus = text(payload.trustStatus, 'trustStatus') as CatalogRelease['trustStatus']; const status = text(payload.status, 'status') as CatalogRelease['status']; if (!['UNVERIFIED', 'VERIFIED', 'REJECTED'].includes(trustStatus) || !['DISCOVERED', 'INSTALLED', 'ACTIVE', 'DISABLED', 'REMOVED'].includes(status)) throw new Error('Invalid release lifecycle status'); const release = await input.store.update((index) => { const target = index.catalogReleases.find((candidate) => candidate.id === releaseId); if (!target) throw new Error('Catalog release does not exist'); target.trustStatus = trustStatus; target.status = status; target.updatedAt = new Date().toISOString(); return target; }); await audit('catalog.release.transitioned', [release.id], { trustStatus, status }); return json(response, 200, release); }
+      if (request.method === 'POST' && url.pathname === '/v1/access/grants') { const payload = await body(request); const grant: AccessGrant = { id: await input.core.issue('ACCESS_GRANT'), granteeKind: text(payload.granteeKind, 'granteeKind') as AccessGrant['granteeKind'], granteeId: text(payload.granteeId, 'granteeId'), operations: stringArray(payload.operations, 'operations'), organizationId: optional(payload.organizationId), workspaceId: optional(payload.workspaceId), applicationKey: optional(payload.applicationKey), issuedByUserId: optional(payload.issuedByUserId), expiresAt: optional(payload.expiresAt), createdAt: new Date().toISOString() }; if (!['USER', 'APPLICATION', 'GROUP'].includes(grant.granteeKind)) throw new Error('Invalid granteeKind'); await input.store.update((index) => { index.grants.push(grant); }); await audit('access.grant.created', [grant.id, grant.granteeId]); return json(response, 201, grant); }
+      if (request.method === 'POST' && /^\/v1\/access\/grants\/[^/]+\/revoke$/.test(url.pathname)) { const grantId = decodeURIComponent(url.pathname.split('/')[4] ?? ''); const grant = await input.store.update((index) => { const target = index.grants.find((entry) => entry.id === grantId); if (!target) throw new Error('Grant does not exist'); if (!target.revokedAt) target.revokedAt = new Date().toISOString(); return target; }); await audit('access.grant.revoked', [grant.id, grant.granteeId]); return json(response, 200, grant); }
+      return json(response, 404, { error: 'Foundation Access endpoint not found.' });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Foundation Access error';
+      const status = /bearer session token|Session token|Session is no longer active/i.test(message) ? 401 : /required|does not exist|already|Invalid|cannot|valid email|password must|password is too long|does not match/i.test(message) ? 400 : 500;
+      return json(response, status, { error: message, traceId: randomUUID() });
+    }
+  });
+}
