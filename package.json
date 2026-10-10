@@ -1,6 +1,6 @@
 {
   "name": "@selo/sema-foundation",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "description": "SEMA Foundation: widely used functions (errors, logging, settings, documentation shape) installed with every installation.",
   "type": "module",

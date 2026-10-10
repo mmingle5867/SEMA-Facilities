@@ -15,9 +15,9 @@ export function documentationManifest(input: DocumentationManifest): Readonly<Do
 
 export function getFoundationDocumentation() {
   return documentationManifest({
-    packageName: '@selo/sema-foundation', version: '0.1.0',
+    packageName: '@selo/sema-foundation', version: '0.2.0',
     summary: 'Widely used foundation functions for errors, logging, settings, and package documentation.',
     publicApi: ['SemaError', 'Logger', 'SettingsStore', 'documentationManifest'],
-    changeNotes: ['Initial portable foundation functions.'],
+    changeNotes: ['Initial portable foundation functions.', '0.2.0: package renamed from sema-facilities to sema-foundation; Foundation now means widely used functions, shared object definitions moved to sema-objects.'],
   });
 }
