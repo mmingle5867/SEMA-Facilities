@@ -13,11 +13,11 @@ export function documentationManifest(input: DocumentationManifest): Readonly<Do
   return Object.freeze({ ...input, publicApi: [...input.publicApi], dependencies: [...(input.dependencies ?? [])], changeNotes: [...(input.changeNotes ?? [])] });
 }
 
-export function getFacilitiesDocumentation() {
+export function getFoundationDocumentation() {
   return documentationManifest({
-    packageName: '@selo/sema-facilities', version: '0.1.0',
-    summary: 'Minimal cross-application technical ports for errors, logging, settings, and package documentation.',
+    packageName: '@selo/sema-foundation', version: '0.1.0',
+    summary: 'Widely used foundation functions for errors, logging, settings, and package documentation.',
     publicApi: ['SemaError', 'Logger', 'SettingsStore', 'documentationManifest'],
-    changeNotes: ['Initial portable facility contracts.'],
+    changeNotes: ['Initial portable foundation functions.'],
   });
 }
