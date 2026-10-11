@@ -53,10 +53,21 @@ try {
   assert.equal(logout.status, 200);
   const expired = await fetch('http://127.0.0.1:4349/v1/access/auth/me', { headers: { authorization: `Bearer ${signedIn.accessToken}` } });
   assert.equal(expired.status, 401);
-  const nodeResponse = await fetch('http://127.0.0.1:4349/v1/access/nodes', { method: 'POST', headers: { 'content-type': 'application/json', 'x-sema-access-admin-key': 'admin' }, body: JSON.stringify({ displayName: 'Ohio Region', issuingParentNodeId: initial.rootNode.id, operationalParentNodeId: initial.rootNode.id, controllerOrganizationId: initial.organization.id, classification: 'region' }) });
+  const nodeResponse = await fetch('http://127.0.0.1:4349/v1/access/nodes', { method: 'POST', headers: { 'content-type': 'application/json', 'x-sema-access-admin-key': 'admin' }, body: JSON.stringify({ displayName: 'Ohio Region', parentNodeId: initial.rootNode.id, controllerOrganizationId: initial.organization.id, classification: 'region' }) });
   assert.equal(nodeResponse.status, 201);
-  const node = await nodeResponse.json() as { id: string; issuingParentNodeId: string };
-  assert.equal(node.issuingParentNodeId, initial.rootNode.id);
+  const node = await nodeResponse.json() as { id: string; parentNodeId: string };
+  assert.equal(node.parentNodeId, initial.rootNode.id);
+  // Insert a node above the region, then remove it: the region goes back to the root, and no ID changes.
+  const adminHeaders = { 'content-type': 'application/json', 'x-sema-access-admin-key': 'admin' };
+  const inserted = await (await fetch('http://127.0.0.1:4349/v1/access/nodes', { method: 'POST', headers: adminHeaders, body: JSON.stringify({ displayName: 'Midwest', insertAboveNodeId: node.id }) })).json() as { id: string; parentNodeId: string };
+  assert.equal(inserted.parentNodeId, initial.rootNode.id);
+  const removal = await fetch(`http://127.0.0.1:4349/v1/access/nodes/${encodeURIComponent(inserted.id)}/remove`, { method: 'POST', headers: adminHeaders, body: '{}' });
+  assert.equal(removal.status, 200);
+  const removed = await removal.json() as { repointed: string[]; newParentNodeId: string };
+  assert.deepEqual(removed.repointed, [node.id]);
+  assert.equal(removed.newParentNodeId, initial.rootNode.id);
+  const topRemoval = await fetch(`http://127.0.0.1:4349/v1/access/nodes/${encodeURIComponent(initial.rootNode.id)}/remove`, { method: 'POST', headers: adminHeaders, body: '{}' });
+  assert.notEqual(topRemoval.status, 200); // the top node's children need a named destination
   const application = await fetch('http://127.0.0.1:4349/v1/access/applications/import', { method: 'POST', headers: { 'content-type': 'application/json', 'x-sema-access-admin-key': 'admin' }, body: JSON.stringify({ applicationKey: 'vectorforge', displayName: 'VectorForge', version: '0.71.3', manifest: { declaredActions: ['asset.import', 'asset.publish'] } }) });
   assert.equal(application.status, 201);
   const applicationRecord = await application.json() as { id: string };

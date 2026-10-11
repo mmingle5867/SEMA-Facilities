@@ -12,10 +12,10 @@ export type GroupMembership = { id: string; groupId: string; userId: string; sta
 export type Delegation = { id: string; delegatorUserId: string; delegateUserId: string; organizationId: string; workspaceId?: string; applicationKey?: string; operations: string[]; effectiveAt: string; expiresAt: string; revokedAt?: string; note?: string; createdAt: string };
 export type StorageLocation = { id: string; organizationId: string; workspaceId?: string; displayName: string; rootUri: string; status: RecordStatus; createdAt: string };
 
-/** The permanent allocation lineage never changes. The operational parent may be rehomed atomically. */
+/** The parent pointer holds the parent's permanent ID and is the only record of the tree. Rehoming, insertion and removal change pointers, never IDs. */
 export type SemaNode = {
   id: string; displayName: string; classification?: string; status: NodeStatus;
-  issuingParentNodeId?: string; operationalParentNodeId?: string; controllerOrganizationId?: string;
+  parentNodeId?: string; controllerOrganizationId?: string;
   issuedAt: string; updatedAt: string;
 };
 
