@@ -44,7 +44,7 @@ tested.
 
 - users, organizations, workspaces, memberships, and workspace storage registrations;
 - application definitions and manifests;
-- SEMA node records, including permanent issuing lineage and separately mutable operational-parent relationship;
+- SEMA node records, each with one parent pointer holding the parent's permanent ID (the only record of the tree);
 - catalog records for capabilities/services and their discovery → verification → install → activation lifecycle;
 - scoped access-grant records.
 
@@ -112,5 +112,5 @@ source package.
 - A capability may be discovered without being usable.
 - Catalog release lifecycle is explicit: `DISCOVERED → INSTALLED → ACTIVE`; verification status is separate.
 - Application manifest import declares requested authority; it grants nothing.
-- Node KeyIDs and issuance lineage never change. Rehoming changes only the operational-parent relationship and is audited.
+- Node KeyIDs never change. Rehoming, insertion above a node and removal change parent pointers only, and each is audited. Removing a node gives its children to its parent; the top node needs `childrenParentNodeId`. Older stored nodes with `issuingParentNodeId`/`operationalParentNodeId` are migrated to `parentNodeId` on load.
 - This package provides management records and Core application-policy evaluation. Multi-party rehome handshakes, signatures, package download/verification, and user sign-in remain later implementation work.
