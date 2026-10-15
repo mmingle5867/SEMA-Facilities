@@ -29,7 +29,7 @@ await new Promise<void>((resolve) => access.listen(4349, '127.0.0.1', resolve));
 try {
   const bootstrap = await fetch('http://127.0.0.1:4349/v1/access/bootstrap', { method: 'POST', headers: { 'content-type': 'application/json', 'x-sema-access-bootstrap-key': 'bootstrap' }, body: JSON.stringify({ userDisplayName: 'Mike Mingle', email: 'mike@example.test', organizationDisplayName: 'NEO Software', workspaces: ['Software Development', 'Artwork & Production'], rootNodeDisplayName: 'NEO Software Local Node' }) });
   assert.equal(bootstrap.status, 201);
-  const initial = await bootstrap.json() as { user: { id: string }; organization: { id: string }; rootNode: { id: string } };
+  const initial = await bootstrap.json() as { user: { id: string }; organization: { id: string } };
   const personResponse = await fetch('http://127.0.0.1:4349/v1/access/users', { method: 'POST', headers: { 'content-type': 'application/json', 'x-sema-access-admin-key': 'admin' }, body: JSON.stringify({ displayName: 'New Person' }) });
   assert.equal(personResponse.status, 201);
   const person = await personResponse.json() as { user: { id: string; email?: string } };
@@ -53,21 +53,21 @@ try {
   assert.equal(logout.status, 200);
   const expired = await fetch('http://127.0.0.1:4349/v1/access/auth/me', { headers: { authorization: `Bearer ${signedIn.accessToken}` } });
   assert.equal(expired.status, 401);
-  const nodeResponse = await fetch('http://127.0.0.1:4349/v1/access/nodes', { method: 'POST', headers: { 'content-type': 'application/json', 'x-sema-access-admin-key': 'admin' }, body: JSON.stringify({ displayName: 'Ohio Region', parentNodeId: initial.rootNode.id, controllerOrganizationId: initial.organization.id, classification: 'region' }) });
-  assert.equal(nodeResponse.status, 201);
-  const node = await nodeResponse.json() as { id: string; parentNodeId: string };
-  assert.equal(node.parentNodeId, initial.rootNode.id);
-  // Insert a node above the region, then remove it: the region goes back to the root, and no ID changes.
+  // A node in Core's tree gets its name here. An organization or user record with the same ID is already its name.
   const adminHeaders = { 'content-type': 'application/json', 'x-sema-access-admin-key': 'admin' };
-  const inserted = await (await fetch('http://127.0.0.1:4349/v1/access/nodes', { method: 'POST', headers: adminHeaders, body: JSON.stringify({ displayName: 'Midwest', insertAboveNodeId: node.id }) })).json() as { id: string; parentNodeId: string };
-  assert.equal(inserted.parentNodeId, initial.rootNode.id);
-  const removal = await fetch(`http://127.0.0.1:4349/v1/access/nodes/${encodeURIComponent(inserted.id)}/remove`, { method: 'POST', headers: adminHeaders, body: '{}' });
-  assert.equal(removal.status, 200);
-  const removed = await removal.json() as { repointed: string[]; newParentNodeId: string };
-  assert.deepEqual(removed.repointed, [node.id]);
-  assert.equal(removed.newParentNodeId, initial.rootNode.id);
-  const topRemoval = await fetch(`http://127.0.0.1:4349/v1/access/nodes/${encodeURIComponent(initial.rootNode.id)}/remove`, { method: 'POST', headers: adminHeaders, body: '{}' });
-  assert.notEqual(topRemoval.status, 200); // the top node's children need a named destination
+  const describeNode = (body: unknown) => fetch('http://127.0.0.1:4349/v1/access/node-descriptions', { method: 'POST', headers: adminHeaders, body: JSON.stringify(body) });
+  const site = await describeNode({ nodeId: '3-9rJ-3', displayName: 'Office', note: 'Main building' });
+  assert.equal(site.status, 200);
+  assert.deepEqual(Object.keys(await site.json()).sort(), ['displayName', 'nodeId', 'note', 'updatedAt']);
+  assert.equal((await describeNode({ nodeId: '3-9rJ-3', displayName: 'NEO Software office' })).status, 200, 'saving again changes the name');
+  const named = (await (await fetch('http://127.0.0.1:4349/v1/access/index', { headers: adminHeaders })).json()) as { nodeDescriptions: Array<{ nodeId: string; displayName: string; note?: string }> };
+  assert.deepEqual(named.nodeDescriptions.map((entry) => [entry.nodeId, entry.displayName, entry.note ?? null]), [['3-9rJ-3', 'NEO Software office', null]], 'one description per node, replaced in place');
+  assert.equal((await describeNode({ nodeId: initial.organization.id, displayName: 'Other' })).status, 400, 'an organization keeps its name on its organization record');
+  assert.equal((await describeNode({ nodeId: initial.user.id, displayName: 'Other' })).status, 400, 'a user keeps its name on its user record');
+  assert.equal((await describeNode({ nodeId: '3--3', displayName: 'Bad' })).status, 400);
+  assert.equal((await describeNode({ nodeId: '3-9rJ-4' })).status, 400, 'a name is required');
+  assert.equal((await fetch('http://127.0.0.1:4349/v1/access/node-descriptions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ nodeId: '3-4', displayName: 'x' }) })).status, 403);
+  assert.equal((await fetch('http://127.0.0.1:4349/v1/access/nodes', { headers: adminHeaders })).status, 404, 'the old node records are gone');
   const application = await fetch('http://127.0.0.1:4349/v1/access/applications/import', { method: 'POST', headers: { 'content-type': 'application/json', 'x-sema-access-admin-key': 'admin' }, body: JSON.stringify({ applicationKey: 'vectorforge', displayName: 'VectorForge', version: '0.71.3', manifest: { declaredActions: ['asset.import', 'asset.publish'] } }) });
   assert.equal(application.status, 201);
   const applicationRecord = await application.json() as { id: string };
