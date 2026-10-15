@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { RESOURCE_CATALOG_CAPABILITY, RESOURCE_DELIVERY_CAPABILITY, type ResourceRecord } from './contracts.js';
+import { RESOURCE_CATALOG_CAPABILITY, RESOURCE_DELIVERY_CAPABILITY, type ResourceGroup, type ResourceRecord } from './contracts.js';
 import { allows } from './policy.js';
 import { ResourceStore } from './store.js';
 
@@ -20,18 +20,30 @@ export async function createResourceServer(store: ResourceStore, adminKey: strin
   return createServer(async (request, response) => {
     const url = new URL(request.url ?? '/', 'http://127.0.0.1');
     try {
-      if (request.method === 'GET' && url.pathname === '/v1/resources/health') return json(response, 200, { status: 'ACTIVE', service: 'sema.foundation.resource', facility: 'sema.foundation.resource', version: '0.2.0' });
+      if (request.method === 'GET' && url.pathname === '/v1/resources/health') return json(response, 200, { status: 'ACTIVE', service: 'sema.foundation.resource', facility: 'sema.foundation.resource', version: '0.3.0' });
       if (request.method === 'GET' && url.pathname === '/v1/resources/admin/index') {
         if (!admin(request, adminKey)) return json(response, 403, { error: 'Resource administration requires the Foundation Resource service credential.' });
         const index = await store.load();
-        return json(response, 200, { resources: index.resources.map(({ sha256: _sha256, ...resource }) => resource), grants: index.grants });
+        return json(response, 200, { resources: index.resources.map(({ sha256: _sha256, ...resource }) => resource), grants: index.grants, groups: index.groups });
       }
       if (request.method === 'POST' && url.pathname === '/v1/resources/publish') {
         if (!admin(request, adminKey)) return json(response, 403, { error: 'Publish requires the Foundation Resource service credential.' });
         const raw = request.headers['x-sema-resource']; if (typeof raw !== 'string') return json(response, 400, { error: 'x-sema-resource metadata is required.' });
         const metadata = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as Omit<ResourceRecord, 'byteLength' | 'sha256' | 'publishedAt'>;
         if (!metadata.resourceId || !metadata.resourceVersionId || !metadata.workspaceId || !metadata.ownerId || !metadata.title || !metadata.mimeType || !metadata.source?.applicationKey) return json(response, 400, { error: 'Published resource metadata is incomplete.' });
+        if (metadata.groupId && !(await store.load()).groups.some((group) => group.groupId === metadata.groupId)) return json(response, 400, { error: `Resource group ${metadata.groupId} does not exist: save the group before publishing into it.` });
         const resource = await store.publish(metadata, await body(request)); return json(response, 201, { resource });
+      }
+      if (request.method === 'POST' && url.pathname === '/v1/resources/groups') {
+        if (!admin(request, adminKey)) return json(response, 403, { error: 'Saving a group requires the Foundation Resource service credential.' });
+        const input = JSON.parse((await body(request)).toString('utf8')) as Partial<ResourceGroup>;
+        const text = (value: unknown) => typeof value === 'string' && value.trim() ? value.trim() : undefined;
+        const categories = Array.isArray(input.categories) ? input.categories : [];
+        const validCategories = categories.every((category) => category && text(category.categoryId) && text(category.name) && Array.isArray(category.path) && category.path.every((part) => typeof part === 'string'));
+        if (!text(input.groupId) || !text(input.workspaceId) || !text(input.ownerId) || !text(input.title) || !text(input.source?.applicationKey) || !validCategories) return json(response, 400, { error: 'Group is incomplete: groupId, workspaceId, ownerId, title and source.applicationKey are required, and each category needs categoryId, name and path.' });
+        if ((input.description ?? '').length > 20_000) return json(response, 400, { error: 'Description cannot exceed 20,000 characters.' });
+        const group = await store.saveGroup({ groupId: text(input.groupId)!, workspaceId: text(input.workspaceId)!, ownerId: text(input.ownerId)!, title: text(input.title)!, ...(text(input.description) ? { description: text(input.description) } : {}), categories: categories.map((category) => ({ categoryId: category.categoryId.trim(), name: category.name.trim(), path: category.path.map((part) => part.trim()) })), source: { applicationKey: text(input.source!.applicationKey)!, ...(text(input.source!.artworkId) ? { artworkId: text(input.source!.artworkId) } : {}) } });
+        return json(response, 200, { group });
       }
       if (request.method === 'POST' && url.pathname === '/v1/resources/grants') {
         if (!admin(request, adminKey)) return json(response, 403, { error: 'Grant administration requires the Foundation Resource service credential.' });
@@ -43,7 +55,9 @@ export async function createResourceServer(store: ResourceStore, adminKey: strin
         const app = application(request); if (!app) return json(response, 401, { error: 'x-sema-application-key is required.' });
         if (!(await policyAllows(app, 'resource.catalog.read'))) return json(response, 403, { error: 'Application is not authorized to read the resource catalog.' });
         const index = await store.load(); const resources = index.resources.filter(resource => allows(index, resource, app, 'catalog')).map(({ sha256: _sha256, ...safe }) => safe);
-        return json(response, 200, { capabilityKey: RESOURCE_CATALOG_CAPABILITY, contractVersion: '1.0.0', resources });
+        // The groups the caller may see: those holding at least one file it may see. Description and categories travel with them.
+        const visible = new Set(resources.map((resource) => resource.groupId).filter(Boolean));
+        return json(response, 200, { capabilityKey: RESOURCE_CATALOG_CAPABILITY, contractVersion: '1.1.0', resources, groups: index.groups.filter((group) => visible.has(group.groupId)) });
       }
       const match = /^\/v1\/resources\/([^/]+)\/([^/]+)\/content$/.exec(url.pathname);
       if (request.method === 'GET' && match) {
