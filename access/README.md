@@ -35,8 +35,8 @@ an index export does not include password hashes or session tokens.
 This release provides the authority service and administrator API only. The
 System Console is its administration client; it does not store passwords or
 make permission decisions. This release also adds explicit, audited update
-endpoints for user display names, memberships, organizations, workspaces,
-nodes, application registry records, and grant revocation. VectorForge and
+endpoints for user display names, memberships, organizations, workspaces, node
+descriptions, application registry records, and grant revocation. VectorForge and
 ListingForge remain on their current sign-in path until that integration is
 tested.
 
@@ -44,7 +44,7 @@ tested.
 
 - users, organizations, workspaces, memberships, and workspace storage registrations;
 - application definitions and manifests;
-- SEMA node records, each with one parent pointer holding the parent's permanent ID (the only record of the tree);
+- node descriptions: the name and a note for a node in SEMA Core's tree that has no organization or user record (a site, a machine, a group of people). Core holds the tree itself; an organization or user record with the same ID is already that node's name;
 - catalog records for capabilities/services and their discovery → verification → install → activation lifecycle;
 - scoped access-grant records.
 
@@ -81,9 +81,7 @@ The on-disk JSON store is the portable local-first persistence adapter for this 
    {
      "userDisplayName": "Mike Mingle",
      "organizationDisplayName": "NEO Software",
-     "workspaces": ["Software Development", "Artwork & Production"],
-     "rootNodeDisplayName": "NEO Software Local Node",
-     "rootNodeClassification": "company"
+     "workspaces": ["Software Development", "Artwork & Production"]
    }
    ```
 
@@ -112,5 +110,5 @@ source package.
 - A capability may be discovered without being usable.
 - Catalog release lifecycle is explicit: `DISCOVERED → INSTALLED → ACTIVE`; verification status is separate.
 - Application manifest import declares requested authority; it grants nothing.
-- Node KeyIDs never change. Rehoming, insertion above a node and removal change parent pointers only, and each is audited. Removing a node gives its children to its parent; the top node needs `childrenParentNodeId`. Older stored nodes with `issuingParentNodeId`/`operationalParentNodeId` are migrated to `parentNodeId` on load.
+- `POST /v1/access/node-descriptions` `{nodeId, displayName, note?}` sets or changes a node's name, one record per node, audited. It is refused for an ID that has an organization or user record. Access's own node records, from before Core kept the tree, were removed in 0.7.0; an older data file drops them when it is next saved.
 - This package provides management records and Core application-policy evaluation. Multi-party rehome handshakes, signatures, package download/verification, and user sign-in remain later implementation work.

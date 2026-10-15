@@ -7,7 +7,11 @@ export class AccessStore {
   private readonly path: string;
   constructor(root: string) { this.path = join(root, 'access-index.json'); }
   async initialize() { await mkdir(join(this.path, '..'), { recursive: true }); try { await readFile(this.path); } catch { await this.save(blankIndex()); } }
-  async load(): Promise<AccessIndex> { const index = JSON.parse(await readFile(this.path, 'utf8')) as AccessIndex; for (const node of index.nodes as Array<Record<string, unknown>>) { if (node.parentNodeId === undefined) node.parentNodeId = node.operationalParentNodeId ?? node.issuingParentNodeId; delete node.operationalParentNodeId; delete node.issuingParentNodeId; if (node.parentNodeId === undefined) delete node.parentNodeId; } index.testingNotes ??= []; index.changePackets ??= []; index.roleDefinitions ??= []; index.groups ??= []; index.groupMemberships ??= []; index.delegations ??= []; return index; }
+  /**
+   * Older files held Access's own node records, from before SEMA Core kept the tree. They are dropped: Core holds the
+   * nodes, and Access keeps only their names (nodeDescriptions). The drop is written the next time the file is saved.
+   */
+  async load(): Promise<AccessIndex> { const index = JSON.parse(await readFile(this.path, 'utf8')) as AccessIndex & { nodes?: unknown }; delete index.nodes; index.nodeDescriptions ??= []; index.testingNotes ??= []; index.changePackets ??= []; index.roleDefinitions ??= []; index.groups ??= []; index.groupMemberships ??= []; index.delegations ??= []; return index; }
   async save(index: AccessIndex) { const temporary = `${this.path}.${randomUUID()}.tmp`; await writeFile(temporary, JSON.stringify(index, null, 2)); await rename(temporary, this.path); }
   async update<T>(fn: (index: AccessIndex) => T | Promise<T>) { const index = await this.load(); const result = await fn(index); await this.save(index); return result; }
 }
