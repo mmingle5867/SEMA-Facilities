@@ -1,4 +1,4 @@
-# SEMA Foundation Resource v0.2.0
+# SEMA Foundation Resource v0.3.0
 
 This is the policy-controlled boundary for published resources. It stores only explicitly published versions and never accepts private source paths, application databases, or end-user share credentials.
 
@@ -14,3 +14,11 @@ SEMA_POLICY_KEY="the-same-policy-key-used-by-Foundation-Access"
 Both gates must pass: Foundation Access must authorize the application's requested operation, and the service must have an unexpired exact resource/version grant. `GET /v1/resources/admin/index` is loopback administration data only and requires `x-sema-admin-key`; it exists for System Console's Resource Access page. It never returns resource bytes.
 
 This local v0.2.0 establishes the contracts and audit boundary. It is intentionally loopback-only; enterprise service identities, signed user sessions, encrypted offline caches, and remote shared-storage adapters will be added through the same policy contract rather than embedded in Forge applications.
+
+## Groups (0.3.0)
+
+Files shared together, such as every output of one artwork, belong to a group. `POST /v1/resources/groups` (service credential) saves or replaces a group: `{groupId, workspaceId, ownerId, title, description?, categories: [{categoryId, name, path}], source: {applicationKey, artworkId?}}`. The group's ID is the ID of the thing the files came from, so sharing again updates the same group and no new ID is used. A published file names its group with `groupId` in its metadata; publishing into a group that does not exist is refused. The group keeps no list of its files: which files belong is read from their `groupId`.
+
+The catalog (contract 1.1.0) returns `groups` beside `resources`: only groups holding at least one file the caller may see. Description and categories are as they were when shared, so a consumer has them even when the source application is closed.
+
+`npm test` runs the smoke test.
