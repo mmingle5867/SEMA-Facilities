@@ -4,3 +4,6 @@ node_modules/
 !.env.example
 *.zip
 *.log
+# Private keys never leave the machine
+access/keys/
+resource/keys/

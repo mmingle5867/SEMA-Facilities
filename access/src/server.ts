@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import type { AccessGrant, AccessGroup, ApplicationDefinition, CatalogRelease, ChangePacket, Delegation, GroupMembership, RoleDefinition, NodeDescription, StorageLocation, TestingNote, User, Workspace, Organization, Membership } from './contracts.js';
@@ -5,6 +6,8 @@ import { AuthStore } from './auth-store.js';
 import { authenticateToken, bearerToken, createCredential, issueSession, normalizeEmail, verifyPassword, workspacesForUser } from './auth.js';
 import { AccessStore } from './store.js';
 import { CoreClient } from './core-client.js';
+/** Read from package.json, so the version is written in one place only. */
+const ACCESS_VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
 
 const json = (response: ServerResponse, status: number, value: unknown) => { response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); response.end(JSON.stringify(value)); };
 async function body(request: IncomingMessage) { const chunks: Buffer[] = []; let length = 0; for await (const chunk of request) { const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk); length += value.length; if (length > 256 * 1024) throw new Error('Request body exceeds 256 KiB'); chunks.push(value); } const source = Buffer.concat(chunks).toString('utf8').trim(); return source ? JSON.parse(source) as Record<string, unknown> : {}; }
@@ -21,7 +24,7 @@ export function createAccessServer(input: { store: AccessStore; authStore: AuthS
   return createServer(async (request, response) => {
     const url = new URL(request.url ?? '/', 'http://127.0.0.1');
     try {
-      if (request.method === 'GET' && url.pathname === '/v1/access/health') { const index = await input.store.load(); return json(response, 200, { status: 'ACTIVE', service: 'sema.foundation.access', version: '0.7.0', bootstrapped: Boolean(index.bootstrappedAt), authentication: 'LOCAL_PASSWORD_SESSION' }); }
+      if (request.method === 'GET' && url.pathname === '/v1/access/health') { const index = await input.store.load(); return json(response, 200, { status: 'ACTIVE', service: 'sema.foundation.access', version: ACCESS_VERSION, bootstrapped: Boolean(index.bootstrappedAt), authentication: 'LOCAL_PASSWORD_SESSION', coreRequests: input.core.proof }); }
       if (request.method === 'GET' && url.pathname === '/v1/access/index') { if (!admin(request)) return json(response, 403, { error: 'Administration is required.' }); return json(response, 200, await input.store.load()); }
 
       if (request.method === 'POST' && url.pathname === '/v1/access/policy/evaluate') {

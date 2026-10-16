@@ -1,7 +1,9 @@
-import { resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { AuthStore } from './auth-store.js';
 import { AccessStore } from './store.js';
-import { CoreClient } from './core-client.js';
+import { CoreClient, type CoreRequestSigner } from './core-client.js';
 import { createAccessServer } from './server.js';
 
 const port = Number(process.env.SEMA_FOUNDATION_ACCESS_PORT ?? '4340');
@@ -22,7 +24,25 @@ const store = new AccessStore(dataDirectory);
 const authStore = new AuthStore(dataDirectory);
 await store.initialize();
 await authStore.initialize();
-const server = createAccessServer({ store, authStore, core: new CoreClient((process.env.SEMA_CORE_URL ?? 'http://127.0.0.1:4310').replace(/\/$/, ''), coreApplicationKey, coreApplicationSecret), adminKey, bootstrapKey, policyKey, sessionKey, sessionTtlMinutes });
+const coreUrl = (process.env.SEMA_CORE_URL ?? 'http://127.0.0.1:4310').replace(/\/$/, '');
+// Access signs its requests to Core with its own key (RFC 9421), using Core's shared client code from Core's folder:
+// SEMA_CORE_DIRECTORY, or SEMA-Core beside the SEMA-Foundation folder. Its key file (SEMA_FOUNDATION_ACCESS_KEY_FILE)
+// is made on the first start and must never be committed or copied. Without them it uses its key and secret.
+let signer: CoreRequestSigner | undefined;
+if (coreApplicationSecret) {
+  const coreDirectory = resolve(process.env.SEMA_CORE_DIRECTORY ?? join(process.cwd(), '..', '..', 'SEMA-Core'));
+  try {
+    const { openCoreClientSigning } = await import(pathToFileURL(join(coreDirectory, 'dist', 'keys', 'client-signing.js')).href) as { openCoreClientSigning(input: { keyFile: string; coreUrl: string; applicationKey: string; secret: string }): Promise<CoreRequestSigner & { register(): Promise<void> }> };
+    const signing = await openCoreClientSigning({ keyFile: process.env.SEMA_FOUNDATION_ACCESS_KEY_FILE ?? join(process.cwd(), 'keys', process.platform === 'win32' ? 'access-key.dpapi' : 'access-key.pem'), coreUrl, applicationKey: coreApplicationKey, secret: coreApplicationSecret });
+    signer = signing;
+    console.log(`Foundation Access signs its requests to Core with key ${signing.keyId}.`);
+    await signing.register().catch((error: unknown) => console.warn(`${error instanceof Error ? error.message : error}. It will try again on the first request.`));
+  } catch (error) {
+    console.warn(`Foundation Access cannot sign its requests to Core, so it uses its key and secret: ${error instanceof Error ? error.message : error}`);
+  }
+}
+const version = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
+const server = createAccessServer({ store, authStore, core: new CoreClient(coreUrl, coreApplicationKey, coreApplicationSecret, signer), adminKey, bootstrapKey, policyKey, sessionKey, sessionTtlMinutes });
 await new Promise<void>((resolveListen, reject) => { server.once('error', reject); server.listen(port, process.env.SEMA_FOUNDATION_ACCESS_HOSTNAME ?? '127.0.0.1', () => { server.off('error', reject); resolveListen(); }); });
-console.log(`SEMA Foundation Access v0.5.0 listening on http://${process.env.SEMA_FOUNDATION_ACCESS_HOSTNAME ?? '127.0.0.1'}:${port}`);
+console.log(`SEMA Foundation Access v${version} listening on http://${process.env.SEMA_FOUNDATION_ACCESS_HOSTNAME ?? '127.0.0.1'}:${port}`);
 for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, () => server.close(() => process.exit(0)));

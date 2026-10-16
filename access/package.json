@@ -1,13 +1,13 @@
 {
   "name": "@selo/foundation-access",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "description": "Local-first SEMA Foundation service for organizations, workspaces, nodes, applications, access, and service lifecycle administration.",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
-    "test": "tsx test/smoke.ts",
+    "test": "tsx test/smoke.ts && tsx test/signing.ts",
     "start": "node --env-file=.env dist/start.js",
     "dev": "tsx --env-file=.env src/start.ts"
   },
